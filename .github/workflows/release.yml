@@ -1,0 +1,179 @@
+name: Release & Publish
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'bin/**'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'README.md'
+      - 'SKILL.md'
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Decide action
+    runs-on: ubuntu-latest
+    outputs:
+      action: ${{ steps.decide.outputs.action }}
+      version: ${{ steps.decide.outputs.version }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Decide
+        id: decide
+        run: |
+          CURRENT=$(node -p "require('./package.json').version")
+
+          # Check if this version is already published to npm
+          if npm view "@osanoai/linkedin@$CURRENT" version >/dev/null 2>&1; then
+            echo "action=bump" >> $GITHUB_OUTPUT
+            echo "Version $CURRENT already on npm — will create bump PR"
+          else
+            echo "action=publish" >> $GITHUB_OUTPUT
+            echo "version=$CURRENT" >> $GITHUB_OUTPUT
+            echo "Version $CURRENT not on npm — will publish"
+          fi
+
+  # ── BUMP PATH: version exists on npm → open a PR to increment ──────────
+
+  bump:
+    name: Create version bump PR
+    needs: check
+    if: needs.check.outputs.action == 'bump'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+        with:
+          node-version: '24'
+
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf # v2.2.1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Bump version and open PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          # Skip if a bump PR is already open
+          EXISTING=$(gh pr list --base main --head "chore/version-bump" --state open --json number -q '.[0].number')
+          if [ -n "$EXISTING" ]; then
+            echo "Bump PR #$EXISTING already open — skipping"
+            exit 0
+          fi
+
+          npm version patch --no-git-tag-version
+          VERSION=$(node -p "require('./package.json').version")
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+
+          BRANCH="chore/version-bump"
+          git checkout -b "$BRANCH"
+          git add package.json
+          git commit -m "chore: release v$VERSION"
+          git push -f origin "$BRANCH"
+
+          gh pr create \
+            --title "chore: release v$VERSION" \
+            --body "Automated patch version bump. Merging publishes v$VERSION to npm." \
+            --base main \
+            --head "$BRANCH"
+          gh pr merge --auto --squash
+
+  # ── PUBLISH PATH: new version → scan, test, publish ────────────────────
+
+  scan:
+    name: Security Scan
+    needs: check
+    if: needs.check.outputs.action == 'publish'
+    uses: ./.github/workflows/scan.yml
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+
+  test:
+    name: Tests
+    needs: scan
+    uses: ./.github/workflows/tests.yml
+
+  publish:
+    name: Publish & Release
+    needs: [check, test]
+    if: needs.check.outputs.action == 'publish'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: main
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Verify npm supports OIDC
+        run: |
+          NPM_VERSION=$(npm --version)
+          echo "npm version: $NPM_VERSION"
+          MAJOR=$(echo "$NPM_VERSION" | cut -d. -f1)
+          MINOR=$(echo "$NPM_VERSION" | cut -d. -f2)
+          PATCH=$(echo "$NPM_VERSION" | cut -d. -f3)
+          if [ "$MAJOR" -lt 11 ] || \
+             ([ "$MAJOR" -eq 11 ] && [ "$MINOR" -lt 5 ]) || \
+             ([ "$MAJOR" -eq 11 ] && [ "$MINOR" -eq 5 ] && [ "${PATCH:-0}" -lt 1 ]); then
+            echo "::error::npm >= 11.5.1 required for OIDC. Found: $NPM_VERSION"
+            exit 1
+          fi
+
+      # Zero runtime dependencies and no build step: the package publishes
+      # straight from bin/ + src/. Publishing uses the npm CLI for OIDC
+      # trusted publishing with provenance (same as osanoai/multicli).
+      - name: Publish to npm with provenance
+        run: npm publish --provenance --access public
+
+      - name: Tag and release
+        run: |
+          git tag "v${{ needs.check.outputs.version }}"
+          git push origin "v${{ needs.check.outputs.version }}"
+
+      - name: Create GitHub Release
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: `v${{ needs.check.outputs.version }}`,
+              name: `v${{ needs.check.outputs.version }}`,
+              generate_release_notes: true,
+            });
