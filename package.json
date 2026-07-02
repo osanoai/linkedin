@@ -1,6 +1,6 @@
 {
   "name": "@osanoai/linkedin",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Zero-dependency CLI to authenticate with LinkedIn and create posts on behalf of the authenticated member: text, article/URL shares, images, video, and @-mentions.",
   "type": "module",
   "bin": {
